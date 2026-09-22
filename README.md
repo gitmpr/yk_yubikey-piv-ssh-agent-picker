@@ -34,6 +34,21 @@ not on a hot path.
 ## Install
 
 ```
+./install.sh
+```
+
+Checks dependencies and `pcscd` status (warns with the fix rather than
+auto-installing anything), refuses to run if `~/.bashrc` already has a
+Ctrl+F3 bind (old or new F3 escape sequence, or a `yk_bind` name
+collision) rather than risk double-binding or clobbering an existing
+one, backs up `~/.bashrc` before touching it, adds `~/.local/bin` to
+`PATH` if it isn't already, and skips the copy silently if
+`~/.local/bin/yk` is already identical (prompts before overwriting if
+it differs). Then open a new shell, or re-source `~/.bashrc`.
+
+To do it by hand instead:
+
+```
 sudo apt install python3-pexpect yubikey-manager openssh-client opensc \
     libsecret-tools pinentry-gnome3 fzf psmisc
 sudo systemctl enable --now pcscd
@@ -44,9 +59,6 @@ chmod +x ~/.local/bin/yk
 cat yk-keybind.bashrc >> ~/.bashrc
 # then open a new shell, or Ctrl+F4-equivalent re-source it
 ```
-
-`~/.local/bin` needs to be on `PATH` (Ubuntu's default `.bashrc` usually
-already adds it if the directory exists).
 
 Only tested against `opensc-pkcs11.so` at its stock Ubuntu path
 (`/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so`, hardcoded as
