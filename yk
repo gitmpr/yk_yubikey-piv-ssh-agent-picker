@@ -2,7 +2,7 @@
 #
 # Dependencies (Ubuntu apt packages):
 #   sudo apt install python3-pexpect yubikey-manager openssh-client opensc \
-#       libsecret-tools pinentry-gnome3 fzf psmisc
+#       pinentry-gnome3 fzf psmisc
 #
 # Everything else this script imports (subprocess, re, shlex, shutil,
 # urllib.parse, ...) is Python standard library, bundled with python3
@@ -45,10 +45,6 @@ PKCS11_PROVIDER = "/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so"
 PINENTRY = _find_pinentry()
 SSH_ADD = shutil.which("ssh-add") or "/usr/bin/ssh-add"
 SSH_AGENT = shutil.which("ssh-agent") or "/usr/bin/ssh-agent"
-# Attribute pair used to key cached PINs in the freedesktop Secret
-# Service (see get_secret()) - arbitrary but must be consistent between
-# the `secret-tool store` invocation you run yourself and this script.
-SECRET_ATTRIBUTES = ("application", "yk-piv-agent")
 
 SLOT_RE = re.compile(
     r"Slot \d+ \([^)]*\): (?P<reader>.+?)\n"
@@ -61,31 +57,6 @@ YELLOW = "\033[33m"
 BG_RED = "\033[41m"
 BG_GREEN = "\033[42m"
 RESET = "\033[0m"
-
-
-def get_secret(serial: str) -> str | None:
-    """Look up a cached PIN for `serial` from the freedesktop Secret
-    Service via secret-tool. Returns None if nothing is stored for it -
-    store one yourself with:
-
-        secret-tool store --label="YubiKey <serial> PIV PIN" \\
-            application yk-piv-agent yubikey-serial <serial>
-    """
-    args = ["secret-tool", "lookup", *SECRET_ATTRIBUTES, "yubikey-serial", serial]
-
-    try:
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-    secret = result.stdout.rstrip("\n")
-    return secret or None
 
 
 def list_yubikeys() -> list[tuple[str, str]]:
@@ -457,12 +428,11 @@ def add_provider(pin: str) -> tuple[int, str]:
 
 def main():
     shell_mode = "--shell" in sys.argv[1:]
-    prompt_pin = "--prompt-pin" in sys.argv[1:]
     test_pin = "--test-pin" in sys.argv[1:]
-    valid_arguments = ("--shell", "--prompt-pin", "--test-pin")
+    valid_arguments = ("--shell", "--test-pin")
     if any(argument not in valid_arguments for argument in sys.argv[1:]):
         raise SystemExit(
-            f"usage: {sys.argv[0]} [--shell] [--prompt-pin] [--test-pin]"
+            f"usage: {sys.argv[0]} [--shell] [--test-pin]"
         )
     if test_pin:
         try:
@@ -484,9 +454,7 @@ def main():
         # provider" step needed, since this agent has never had one
         # registered.
         os.environ["SSH_AUTH_SOCK"] = ensure_scoped_agent(selected_serial, keys)
-        pin = None if prompt_pin else get_secret(selected_serial)
-        if pin is None:
-            pin = gtk_pinentry(common_name=common_name)
+        pin = gtk_pinentry(common_name=common_name)
         status, output = add_provider(pin)
         output = output.lstrip()
         if common_name:

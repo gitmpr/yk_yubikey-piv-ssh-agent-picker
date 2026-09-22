@@ -51,16 +51,18 @@ check_bind 'yk_bind' 'something matching "yk_bind" (function name collision)'
 
 echo "==> Checking dependencies"
 missing=()
-for cmd in ykman pkcs11-tool pinentry-gnome3 fzf pkill secret-tool python3; do
+for cmd in ykman pkcs11-tool pinentry-gnome3 fzf pkill python3; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
 done
-if [ "${#missing[@]}" -gt 0 ]; then
-    echo "warning: missing commands: ${missing[*]}" >&2
-    echo "  sudo apt install python3-pexpect yubikey-manager openssh-client opensc \\" >&2
-    echo "      libsecret-tools pinentry-gnome3 fzf psmisc" >&2
-fi
+pexpect_missing=0
 if command -v python3 >/dev/null 2>&1 && ! python3 -c 'import pexpect' >/dev/null 2>&1; then
-    echo "warning: python3-pexpect not importable - install it (see the apt command above)." >&2
+    pexpect_missing=1
+fi
+if [ "${#missing[@]}" -gt 0 ] || [ "$pexpect_missing" -eq 1 ]; then
+    [ "${#missing[@]}" -gt 0 ] && echo "warning: missing commands: ${missing[*]}" >&2
+    [ "$pexpect_missing" -eq 1 ] && echo "warning: python3-pexpect not importable" >&2
+    echo "  sudo apt install python3-pexpect yubikey-manager openssh-client opensc \\" >&2
+    echo "      pinentry-gnome3 fzf psmisc" >&2
 fi
 
 echo "==> Checking pcscd"
@@ -112,11 +114,8 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]] && ! grep -qF '.local/bin' "$BASHRC"; then
 fi
 
 echo "==> Appending the Ctrl+F3 keybind to $BASHRC"
+echo '' >> "$BASHRC"
 cat "$SCRIPT_DIR/yk-keybind.bashrc" >> "$BASHRC"
 
 echo
 echo "Done. Open a new shell (or run: source ~/.bashrc) and press Ctrl+F3 to test."
-echo
-echo "Optional: cache a PIN so you're not prompted every time for a specific key:"
-echo '  secret-tool store --label="YubiKey <serial> PIV PIN" \'
-echo '      application yk-piv-agent yubikey-serial <serial>'

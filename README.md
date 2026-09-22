@@ -54,7 +54,7 @@ To do it by hand instead:
 
 ```
 sudo apt install python3-pexpect yubikey-manager openssh-client opensc \
-    libsecret-tools pinentry-gnome3 fzf psmisc
+    pinentry-gnome3 fzf psmisc
 sudo systemctl enable --now pcscd
 
 cp yk ~/.local/bin/yk
@@ -80,30 +80,18 @@ Press Ctrl+F3 (see `yk-keybind.bashrc`) mid-command in any bash shell.
    picks it automatically.
 3. Starts a dedicated, correctly-scoped `ssh-agent` for that one key.
 4. Prompts for the PIN via a GUI `pinentry` popup (so it doesn't fight
-   your terminal's readline buffer), unless a PIN is already cached for
-   that serial (see below).
+   your terminal's readline buffer).
 5. Adds the identity and points this shell's `SSH_AUTH_SOCK` at the new
    agent - your half-typed command is untouched, since `yk` never writes
    to `READLINE_LINE`.
 
-Flags: `--prompt-pin` forces the interactive prompt even if a PIN is
-cached; `--test-pin` just exercises the `pinentry` popup in isolation;
+Flags: `--test-pin` just exercises the `pinentry` popup in isolation;
 `--shell` (used internally by the keybind) prints only
 `export SSH_AUTH_SOCK=...` to stdout, status to stderr.
 
-### Caching a PIN (optional)
-
-To skip the prompt for a specific key, store its PIN in the freedesktop
-Secret Service (e.g. gnome-keyring):
-
-```
-secret-tool store --label="YubiKey <serial> PIV PIN" \
-    application yk-piv-agent yubikey-serial <serial>
-```
-
-`<serial>` is the numeric serial `ykman list` shows for that key. `yk`
-looks this up (scoped to the one key it's actually adding) before
-falling back to the `pinentry` popup.
+`yk` always prompts for the PIN interactively - it doesn't cache or
+auto-retrieve PINs from anywhere, so there's no stored secret that
+could end up scoped to the wrong key or go stale.
 
 ## Why bash, not a spawned terminal or GUI dialog
 
