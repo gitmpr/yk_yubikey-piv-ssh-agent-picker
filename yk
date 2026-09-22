@@ -135,18 +135,11 @@ def piv_common_name(serial: str) -> str | None:
 def piv_subjects(keys: list[tuple[str, str]]) -> dict[str, str]:
     """Look up piv_subject() for every key, one at a time.
 
-    This used to run concurrently (ThreadPoolExecutor) to make the
-    picker show up faster - reverted after it turned out to actively
-    corrupt results: two YubiKeys passed through a single shared USB
-    controller (common under virtualization, e.g. two hostdevs on one
-    QEMU UHCI controller) can have their APDU command/response streams
-    cross when queried at the same time. Confirmed with a 60-iteration
-    stress test: concurrent calls failed 26/60 times (mostly
-    "ApduError: APDU error: SW=0x6d00", i.e. "instruction not
-    supported" - the signature of a scrambled command stream - plus a
-    few outright timeouts), while the same test run sequentially failed
-    0/60 times. Not worth the ~1s of startup latency this reintroduces
-    with two keys connected.
+    Deliberately not parallelized: two YubiKeys sharing a single USB
+    controller (e.g. two hostdevs on one QEMU UHCI controller under
+    virtualization) can have their APDU command/response streams cross
+    when queried concurrently, corrupting results ("ApduError:
+    SW=0x6d00" or outright timeouts) instead of just failing cleanly.
     """
     return {serial: piv_subject(serial) for serial, _display in keys}
 
