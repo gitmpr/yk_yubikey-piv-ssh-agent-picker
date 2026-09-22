@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+#
+# Dependencies (Ubuntu apt packages):
+#   sudo apt install python3-pexpect yubikey-manager openssh-client opensc \
+#       libsecret-tools pinentry-gnome3 fzf psmisc
+#
+# Everything else this script imports (concurrent.futures, subprocess, re,
+# shlex, shutil, urllib.parse, ...) is Python standard library, bundled
+# with python3 itself - no extra apt package needed. pexpect above is the
+# only non-stdlib Python dependency. psmisc provides pkill, used to kill
+# a previous invocation's dedicated agent before starting a fresh one.
+#
+# Also required as a running background service, not a one-time install:
+#   sudo systemctl enable --now pcscd
+# (PC/SC access to the YubiKey's PIV applet goes through pcscd; ykman/
+# pkcs11-tool/opensc-pkcs11.so all depend on it being up.)
+
+import sys
+import os
+import re
+import shlex
+import shutil
+import concurrent.futures
+from urllib.parse import unquote
+import pexpect
+import subprocess
+
+
+YKMAN = "ykman"
+
+
+def _find_pinentry() -> str:
+    """Prefer an explicit GUI pinentry by name; only pinentry-gnome3 was
+    ever intentional here (see gtk_pinentry()'s Assuan protocol handling,
+    which expects a real popup, not a terminal UI), but gtk2/qt are
+    reasonable GUI fallbacks if gnome3 specifically isn't installed.
+    """
+    for name in ("pinentry-gnome3", "pinentry-gtk2", "pinentry-qt"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return "/usr/bin/pinentry-gnome3"
+
+
+PKCS11_PROVIDER = "/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so"
+PINENTRY = _find_pinentry()
+SSH_ADD = shutil.which("ssh-add") or "/usr/bin/ssh-add"
+SSH_AGENT = shutil.which("ssh-agent") or "/usr/bin/ssh-agent"
+# Attribute pair used to key cached PINs in the freedesktop Secret
+# Service (see get_secret()) - arbitrary but must be consistent between
+# the `secret-tool store` invocation you run yourself and this script.
+SECRET_ATTRIBUTES = ("application", "yk-piv-agent")
+
+SLOT_RE = re.compile(
+    r"Slot \d+ \([^)]*\): (?P<reader>.+?)\n"
+    r"(?:.*\n)*?"
+    r"\s*token label\s*:\s*(?P<label>.+?)\s*\n",
+)
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BG_RED = "\033[41m"
+BG_GREEN = "\033[42m"
+RESET = "\033[0m"
+
+
+def get_secret(serial: str) -> str | None:
+    """Look up a cached PIN for `serial` from the freedesktop Secret
+    Service via secret-tool. Returns None if nothing is stored for it -
+    store one yourself with:
+
+        secret-tool store --label="YubiKey <serial> PIV PIN" \\
+            application yk-piv-agent yubikey-serial <serial>
+    """
+    args = ["secret-tool", "lookup", *SECRET_ATTRIBUTES, "yubikey-serial", serial]
+
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    secret = result.stdout.rstrip("\n")
+    return secret or None
+
+
+def list_yubikeys() -> list[tuple[str, str]]:
+    """Return (serial, display line) pairs for detected YubiKeys."""
+    if not shutil.which(YKMAN):
+        raise RuntimeError("ykman was not found; install yubikey-manager first")
+
+    result = subprocess.run(
+        [YKMAN, "list"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"ykman list failed: {detail or 'unknown error'}")
+
+    keys = []
+    for line in result.stdout.splitlines():
+        match = re.search(r"\bSerial:\s*(\d+)\b", line)
+        if match:
+            keys.append((match.group(1), line.strip()))
+    return keys
+
+
+def piv_subject(serial: str) -> str:
+    """Return the authentication certificate subject for a YubiKey."""
+    result = subprocess.run(
+        [YKMAN, "--device", serial, "piv", "info"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return "PIV subject unavailable"
+    match = re.search(r"^\s*Subject DN:\s*(.+)$", result.stdout, re.MULTILINE)
+    return match.group(1).strip() if match else "PIV subject unavailable"
+
+
+def piv_common_name(serial: str) -> str | None:
+    """Return the authentication certificate CN for a YubiKey."""
+    subject = piv_subject(serial)
+    match = re.search(r"(?:^|,)CN=([^,]+)", subject)
+    return match.group(1).strip() if match else None
+
+
+def piv_subjects(keys: list[tuple[str, str]]) -> dict[str, str]:
+    """Look up piv_subject() for every key concurrently.
+
+    Each call shells out to `ykman piv info`, which is slow enough
+    (especially on FIPS-mode keys) that doing this serially for every
+    connected key noticeably delays the picker showing up at all.
+    """
+    serials = [serial for serial, _display in keys]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(serials))) as pool:
+        return dict(zip(serials, pool.map(piv_subject, serials)))
+
+
+def pick_via_fzf(keys: list[tuple[str, str]]) -> str | None:
+    """Return a selected serial, "" if cancelled, or None if fzf is unavailable.
+
+    Runs fzf as a normal foreground subprocess of this script: it reads
+    the candidate list from stdin, draws its interactive UI straight to
+    /dev/tty, and writes only the final selection to its own stdout - so
+    this works directly inside whatever terminal invoked yk (e.g. a bash
+    `bind -x` keybinding pressed mid-command), no spawned window needed.
+    It's bound to j/k for navigation via fzf's own --bind, unlike
+    zenity/rofi's plain GTK list widget which has no keybind
+    customization at all. Works identically under X11 and Wayland since
+    no windowing protocol is involved.
+    """
+    if not shutil.which("fzf"):
+        return None
+
+    subjects = piv_subjects(keys)
+    choices = "\n".join(
+        f"{serial}\t{subjects[serial]}" for serial, _display in keys
+    )
+    # Only stdout is captured (that's where fzf writes the final
+    # selection). stderr is left connected to the real terminal - that's
+    # where fzf's --height mode actually draws its interactive UI, so
+    # capturing it too (e.g. via capture_output=True, which redirects
+    # both) traps the whole rendered UI in a pipe no one can see: fzf
+    # runs and responds to input correctly the entire time, the screen
+    # just never shows any of it.
+    result = subprocess.run(
+        [
+            "fzf", "--delimiter", "\t", "--with-nth=1,2",
+            "--bind=j:down,k:up",
+            "--prompt=YubiKey> ",
+            "--header=j/k or arrows to move, Enter to select, Esc to cancel",
+            "--height=~40%", "--border", "--layout=reverse",
+        ],
+        input=choices,
+        stdout=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    selected = result.stdout.strip()
+    return selected.split("\t", 1)[0] if selected else ""
+
+
+def pick_via_terminal(keys: list[tuple[str, str]]) -> str | None:
+    """Last-resort numbered prompt, for headless/no-GUI-picker sessions."""
+    subjects = piv_subjects(keys)
+    print("Multiple YubiKeys detected:", file=sys.stderr)
+    for i, (serial, display) in enumerate(keys, 1):
+        print(f"  {i}) {serial}  {subjects[serial]}  ({display})", file=sys.stderr)
+    try:
+        choice = input(f"Select 1-{len(keys)}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return ""
+    if not choice.isdigit() or not (1 <= int(choice) <= len(keys)):
+        return ""
+    return keys[int(choice) - 1][0]
+
+
+def list_pkcs11_slots(opensc_conf: str | None = None) -> list[dict]:
+    """List PKCS#11 slots currently visible through PKCS11_PROVIDER.
+
+    Read-only, no PIN involved. Pass opensc_conf to see what OpenSC would
+    expose under a candidate OPENSC_CONF override.
+    """
+    env = dict(os.environ)
+    if opensc_conf is not None:
+        env["OPENSC_CONF"] = opensc_conf
+    result = subprocess.run(
+        ["pkcs11-tool", "--module", PKCS11_PROVIDER, "--list-slots"],
+        capture_output=True, text=True, check=False, env=env,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"pkcs11-tool --list-slots failed: {result.stderr.strip()}")
+    return [
+        {"reader": m.group("reader").strip(), "label": m.group("label").strip()}
+        for m in SLOT_RE.finditer(result.stdout)
+    ]
+
+
+def write_scoped_opensc_conf(
+    conf_path: str, target_serial: str, keys: list[tuple[str, str]]
+) -> bool:
+    """Write an OPENSC_CONF file at conf_path that hides every PIV token
+    except target_serial, so a PKCS#11 module reading this config can
+    never log in to a token it wasn't meant for. Returns False (and
+    writes nothing) when there's nothing to scope (only one token
+    currently connected).
+
+    ssh-add -s sends a single PIN to every slot opensc-pkcs11.so reports
+    (ssh-pkcs11.c: pkcs11_register_provider() loops all slots and calls
+    C_Login with the same PIN in each) - with two YubiKeys connected and
+    different PINs, that silently burns a PIN retry attempt on whichever
+    one you didn't mean to touch.
+
+    OPENSC_CONF is only read by whatever process calls C_Initialize()
+    for the module - in ssh-agent's case, that's the ssh-pkcs11-helper
+    child it forks internally, which inherits ssh-agent's OWN
+    environment from the moment ssh-agent itself was started. Setting
+    OPENSC_CONF later, per ssh-add invocation, has no effect: ssh-add
+    only talks to the already-running agent over a socket, it doesn't
+    share environment with it. So this file's path is meant to be
+    passed into ssh-agent's own env at spawn time (see
+    ensure_scoped_agent), not toggled around individual ssh-add calls -
+    hence a caller-chosen persistent path here instead of a one-shot
+    tempfile. (Confirmed the hard way: a per-invocation tempfile+env
+    dance here silently did nothing, and a real PIN retry got burned on
+    the wrong key before this was caught.)
+
+    The reader-name suffix PC/SC assigns ("... CCID 00 00" vs "01 00")
+    is a bare enumeration index, not derived from any stable device
+    property, so it must be looked up fresh immediately before each use
+    - never cached across invocations.
+    """
+    if len(keys) < 2:
+        return False
+
+    slots = list_pkcs11_slots()
+    target_label = piv_common_name(target_serial)
+    if not target_label:
+        raise RuntimeError(
+            f"could not determine the PIV certificate CN for YubiKey "
+            f"{target_serial}; refusing to add without a reliable scope"
+        )
+
+    matches = [s for s in slots if s["label"] == target_label]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"expected exactly one PKCS#11 slot labelled {target_label!r} "
+            f"for YubiKey {target_serial}, found {len(matches)}; refusing "
+            f"to add without a reliable scope"
+        )
+
+    others = [s for s in slots if s is not matches[0]]
+    conf_lines = ["app default {"]
+    for s in others:
+        escaped = s["reader"].replace('"', '\\"')
+        conf_lines.append(f'    ignored_readers = "{escaped}";')
+    conf_lines.append("}")
+    conf_text = "\n".join(conf_lines) + "\n"
+
+    with open(conf_path, "w") as f:
+        f.write(conf_text)
+
+    # Self-check before this config is trusted with a real PIN: re-list
+    # slots through it and confirm only the target token remains.
+    verify_labels = [s["label"] for s in list_pkcs11_slots(opensc_conf=conf_path)]
+    if verify_labels != [target_label]:
+        os.unlink(conf_path)
+        raise RuntimeError(
+            f"scoped OPENSC_CONF verification failed: expected only "
+            f"{target_label!r} visible, got {verify_labels!r}"
+        )
+
+    return True
+
+
+def agent_paths_for(serial: str) -> tuple[str, str]:
+    # /run/user/<uid> is the conventional value of $XDG_RUNTIME_DIR, not
+    # something to hardcode - the env var is what's actually guaranteed
+    # by a systemd-logind session; fall back to the convention only if
+    # it's genuinely unset (e.g. a non-systemd session).
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    base = f"{runtime_dir}/yk-agent-{serial}"
+    return base + ".sock", base + ".opensc.conf"
+
+
+def ensure_scoped_agent(serial: str, keys: list[tuple[str, str]]) -> str:
+    """(Re)start a dedicated ssh-agent for `serial`, scoped from birth to
+    only ever see that one PIV token, and return its socket path.
+
+    Always kills and restarts rather than trying to detect and reuse an
+    already-running, already-correctly-scoped instance - simpler, and
+    the cost (re-entering the PIN) is accepted for this workflow, which
+    is only ever invoked deliberately (a keybind press), not on a hot
+    path.
+    """
+    socket_path, conf_path = agent_paths_for(serial)
+
+    subprocess.run(
+        ["pkill", "-f", f"ssh-agent -a {socket_path}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+    )
+    # The just-killed ssh-agent also unlinks its own socket on exit, and
+    # that happens asynchronously (pkill only sends the signal, it
+    # doesn't wait for cleanup) - racing an exists-check against that is
+    # inherently TOCTOU-broken, so just ignore "already gone".
+    for path in (socket_path, conf_path):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+    agent_env = dict(os.environ)
+    if write_scoped_opensc_conf(conf_path, serial, keys):
+        agent_env["OPENSC_CONF"] = conf_path
+
+    # No -P override needed here: DEFAULT_ALLOWED_PROVIDERS
+    # ("/usr/lib*/*,/usr/local/lib*/*", compiled into ssh-agent) already
+    # matches PKCS11_PROVIDER's Ubuntu path.
+    subprocess.run(
+        [SSH_AGENT, "-a", socket_path],
+        env=agent_env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
+    )
+    return socket_path
+
+
+def choose_yubikey(keys: list[tuple[str, str]]) -> str:
+    """Select which connected YubiKey's serial to add."""
+    if len(keys) == 1:
+        return keys[0][0]
+
+    # yk is only ever invoked from a shell keybinding (bash `bind -x`),
+    # so a real terminal is always already present - fzf just draws
+    # into it directly. pick_via_terminal is a last-resort fallback for
+    # when fzf isn't installed.
+    backends = [pick_via_fzf, pick_via_terminal]
+
+    for backend in backends:
+        outcome = backend(keys)
+        if outcome is None:
+            continue  # picker not installed, try the next one
+        if outcome == "":
+            raise RuntimeError("YubiKey selection cancelled")
+        return outcome
+
+    raise RuntimeError(
+        "no YubiKey picker available (install fzf) and terminal "
+        "selection failed"
+    )
+
+
+def gtk_pinentry(common_name: str | None = None, debug: bool = False) -> str:
+    """Read a PIN without taking over the terminal used by Readline."""
+    if not os.path.exists(PINENTRY):
+        raise RuntimeError(f"GTK3 pinentry was not found at {PINENTRY}")
+
+    child = pexpect.spawn(PINENTRY, encoding="utf-8", timeout=30, echo=False)
+    pin = ""
+
+    def read_ok() -> None:
+        child.expect(r"(?m)^OK[^\r\n]*(?:\r\n|\n)")
+
+    def read_pin_data() -> str:
+        index = child.expect(
+            [
+                r"(?m)^D ([^\r\n]*)\r?(?:\n|$)",
+                r"(?m)^ERR[^\r\n]*(?:\r\n|\n|$)",
+            ]
+        )
+        if index == 1:
+            raise RuntimeError("pinentry rejected the PIN request")
+        return child.match.group(1)
+
+    def send_command(command: str) -> None:
+        child.sendline(command)
+        read_ok()
+        if debug:
+            print("pinentry: OK", file=sys.stderr)
+
+    try:
+        read_ok()
+        send_command("SETTITLE YubiKey PIN")
+        if common_name:
+            send_command(f"SETDESC Enter the PIN for {common_name}")
+        send_command("SETPROMPT YubiKey PIN: ")
+        child.sendline("GETPIN")
+        pin = unquote(read_pin_data())
+        read_ok()
+        if debug:
+            print("pinentry: received PIN data", file=sys.stderr)
+        if debug:
+            print("pinentry: OK", file=sys.stderr)
+        child.sendline("BYE")
+        read_ok()
+        child.close()
+    except pexpect.exceptions.TIMEOUT as error:
+        raise RuntimeError("timed out waiting for GTK3 pinentry") from error
+    finally:
+        if child.isalive():
+            child.close(force=True)
+    if not pin:
+        raise RuntimeError("PIN entry was cancelled or returned an empty PIN")
+    return pin.replace("=3D", "=").replace("\\n", "\n").replace("\\\\", "\\")
+
+
+def add_provider(pin: str) -> tuple[int, str]:
+    child = pexpect.spawn(
+        SSH_ADD,
+        ["-s", PKCS11_PROVIDER],
+        encoding="utf-8",
+        timeout=10,
+    )
+    try:
+        child.expect("Enter passphrase for PKCS#11:")
+        child.sendline(pin)
+        child.expect(pexpect.EOF)
+        output = child.before.lstrip()
+        status = child.wait()
+    except pexpect.exceptions.TIMEOUT:
+        child.close(force=True)
+        return 1, "timed out waiting for ssh-add to load the PKCS#11 provider"
+    finally:
+        if child.isalive():
+            child.close()
+    return status, output
+
+
+def main():
+    shell_mode = "--shell" in sys.argv[1:]
+    prompt_pin = "--prompt-pin" in sys.argv[1:]
+    test_pin = "--test-pin" in sys.argv[1:]
+    valid_arguments = ("--shell", "--prompt-pin", "--test-pin")
+    if any(argument not in valid_arguments for argument in sys.argv[1:]):
+        raise SystemExit(
+            f"usage: {sys.argv[0]} [--shell] [--prompt-pin] [--test-pin]"
+        )
+    if test_pin:
+        try:
+            pin = gtk_pinentry(debug=True)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            print(f"yk: pinentry test failed: {error}", file=sys.stderr)
+            sys.exit(1)
+        print(f"GTK3 pinentry returned a non-empty PIN ({len(pin)} characters).")
+        return
+
+    try:
+        keys = list_yubikeys()
+        if not keys:
+            raise RuntimeError("no YubiKey detected; insert a YubiKey and try again")
+        selected_serial = choose_yubikey(keys)
+        common_name = piv_common_name(selected_serial)
+        # Always a fresh, dedicated agent for this serial, scoped from
+        # birth via ensure_scoped_agent - no separate "remove old
+        # provider" step needed, since this agent has never had one
+        # registered.
+        os.environ["SSH_AUTH_SOCK"] = ensure_scoped_agent(selected_serial, keys)
+        pin = None if prompt_pin else get_secret(selected_serial)
+        if pin is None:
+            pin = gtk_pinentry(common_name=common_name)
+        status, output = add_provider(pin)
+        output = output.lstrip()
+        if common_name:
+            output = f"{output.rstrip()}\n{YELLOW}{common_name}{RESET}\n"
+        foreground = GREEN if status == 0 else RED
+        background = BG_GREEN if status == 0 else BG_RED
+        prefix = (
+            f"{foreground}{background}🔑{RESET}"
+            f"{foreground} YubiKey {selected_serial}: {output}{RESET}"
+        )
+        if shell_mode:
+            sys.stderr.write(prefix)
+        else:
+            sys.stdout.write(prefix)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+        print(f"yk: {error}", file=sys.stderr)
+        sys.exit(1)
+
+    if status != 0:
+        sys.exit(status)
+
+    if shell_mode:
+        subprocess.run(
+            [SSH_ADD, "-l"],
+            text=True,
+            check=True,
+            stdout=sys.stderr,
+        )
+        print(f"export SSH_AUTH_SOCK={shlex.quote(os.environ['SSH_AUTH_SOCK'])}")
+    else:
+        subprocess.run([SSH_ADD, '-l'], text=True, check=True)
+
+if __name__ == "__main__":
+    main()
