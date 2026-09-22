@@ -5,27 +5,49 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASHRC="$HOME/.bashrc"
 BIN_DIR="$HOME/.local/bin"
 
+FORCE_BIND=0
+for arg in "$@"; do
+    case "$arg" in
+        --overwrite-bind) FORCE_BIND=1 ;;
+        *)
+            echo "error: unknown argument: $arg" >&2
+            echo "usage: $0 [--overwrite-bind]" >&2
+            exit 1
+            ;;
+    esac
+done
+
 if [ ! -f "$SCRIPT_DIR/yk" ] || [ ! -f "$SCRIPT_DIR/yk-keybind.bashrc" ]; then
     echo "error: expected to find 'yk' and 'yk-keybind.bashrc' next to this script (in $SCRIPT_DIR)" >&2
     exit 1
 fi
 
+# Checks $BASHRC for $1, and on a match prints the matching line(s) (with
+# line numbers, so you can go look) plus $2 as the description. Aborts
+# unless --overwrite-bind was given, in which case it warns and continues.
+check_bind() {
+    local pattern="$1" description="$2" match
+    [ -f "$BASHRC" ] || return 0
+    match="$(grep -nF "$pattern" "$BASHRC" || true)"
+    [ -n "$match" ] || return 0
+
+    if [ "$FORCE_BIND" -eq 1 ]; then
+        echo "warning: $BASHRC already has $description:" >&2
+        echo "$match" | sed 's/^/  /' >&2
+        echo "  --overwrite-bind given, continuing anyway." >&2
+    else
+        echo "error: $BASHRC already has $description:" >&2
+        echo "$match" | sed 's/^/  /' >&2
+        echo "Remove or rename it first, then re-run this installer," >&2
+        echo "or pass --overwrite-bind to install anyway (may result in duplicate/conflicting binds)." >&2
+        exit 1
+    fi
+}
+
 echo "==> Checking for an existing Ctrl+F3 bind in $BASHRC"
-if [ -f "$BASHRC" ] && grep -qF '\e[1;5R' "$BASHRC"; then
-    echo "error: $BASHRC already binds \"\\e[1;5R\" (Ctrl+F3, xterm/libvte form) to something." >&2
-    echo "Remove or rename that binding first, then re-run this installer." >&2
-    exit 1
-fi
-if [ -f "$BASHRC" ] && grep -qF '\e[13;5~' "$BASHRC"; then
-    echo "error: $BASHRC already binds \"\\e[13;5~\" (Ctrl+F3, Kitty keyboard protocol form) to something." >&2
-    echo "Remove or rename that binding first, then re-run this installer." >&2
-    exit 1
-fi
-if [ -f "$BASHRC" ] && grep -qF 'yk_bind' "$BASHRC"; then
-    echo "error: $BASHRC already has something matching \"yk_bind\" (function name collision)." >&2
-    echo "Remove or rename it first, then re-run this installer." >&2
-    exit 1
-fi
+check_bind '\e[1;5R' 'a Ctrl+F3 bind (xterm/libvte form "\e[1;5R")'
+check_bind '\e[13;5~' 'a Ctrl+F3 bind (Kitty keyboard protocol form "\e[13;5~")'
+check_bind 'yk_bind' 'something matching "yk_bind" (function name collision)'
 
 echo "==> Checking dependencies"
 missing=()

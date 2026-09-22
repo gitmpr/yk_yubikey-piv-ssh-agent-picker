@@ -41,10 +41,14 @@ Checks dependencies and `pcscd` status (warns with the fix rather than
 auto-installing anything), refuses to run if `~/.bashrc` already has a
 Ctrl+F3 bind (old or new F3 escape sequence, or a `yk_bind` name
 collision) rather than risk double-binding or clobbering an existing
-one, backs up `~/.bashrc` before touching it, adds `~/.local/bin` to
-`PATH` if it isn't already, and skips the copy silently if
-`~/.local/bin/yk` is already identical (prompts before overwriting if
-it differs). Then open a new shell, or re-source `~/.bashrc`.
+one - printing the actual matching line(s), with line numbers, so you
+can go look. Pass `--overwrite-bind` to install anyway despite a match
+(you'll end up with both bindings in `~/.bashrc`; clean up the old one
+yourself). Also backs up `~/.bashrc` before touching it, adds
+`~/.local/bin` to `PATH` if it isn't already, and skips the copy
+silently if `~/.local/bin/yk` is already identical (prompts before
+overwriting if it differs). Then open a new shell, or re-source
+`~/.bashrc`.
 
 To do it by hand instead:
 
