@@ -59,16 +59,20 @@ if command -v python3 >/dev/null 2>&1 && ! python3 -c 'import pexpect' >/dev/nul
     pexpect_missing=1
 fi
 if [ "${#missing[@]}" -gt 0 ] || [ "$pexpect_missing" -eq 1 ]; then
-    [ "${#missing[@]}" -gt 0 ] && echo "warning: missing commands: ${missing[*]}" >&2
-    [ "$pexpect_missing" -eq 1 ] && echo "warning: python3-pexpect not importable" >&2
+    [ "${#missing[@]}" -gt 0 ] && echo "error: missing commands: ${missing[*]}" >&2
+    [ "$pexpect_missing" -eq 1 ] && echo "error: python3-pexpect not importable" >&2
     echo "  sudo apt install python3-pexpect yubikey-manager openssh-client opensc \\" >&2
     echo "      pinentry-gnome3 fzf psmisc" >&2
+    echo "Install that, then re-run this installer." >&2
+    exit 1
 fi
 
 echo "==> Checking pcscd"
 if command -v systemctl >/dev/null 2>&1 && ! systemctl is-active --quiet pcscd 2>/dev/null; then
-    echo "warning: pcscd is not active - yk needs it for PC/SC access to the YubiKey's PIV applet." >&2
+    echo "error: pcscd is not active - yk needs it for PC/SC access to the YubiKey's PIV applet." >&2
     echo "  sudo systemctl enable --now pcscd" >&2
+    echo "Run that, then re-run this installer." >&2
+    exit 1
 fi
 
 echo "==> Installing yk to $BIN_DIR"
