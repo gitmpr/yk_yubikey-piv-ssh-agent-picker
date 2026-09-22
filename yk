@@ -4,11 +4,11 @@
 #   sudo apt install python3-pexpect yubikey-manager openssh-client opensc \
 #       libsecret-tools pinentry-gnome3 fzf psmisc
 #
-# Everything else this script imports (concurrent.futures, subprocess, re,
-# shlex, shutil, urllib.parse, ...) is Python standard library, bundled
-# with python3 itself - no extra apt package needed. pexpect above is the
-# only non-stdlib Python dependency. psmisc provides pkill, used to kill
-# a previous invocation's dedicated agent before starting a fresh one.
+# Everything else this script imports (subprocess, re, shlex, shutil,
+# urllib.parse, ...) is Python standard library, bundled with python3
+# itself - no extra apt package needed. pexpect above is the only
+# non-stdlib Python dependency. psmisc provides pkill, used to kill a
+# previous invocation's dedicated agent before starting a fresh one.
 #
 # Also required as a running background service, not a one-time install:
 #   sudo systemctl enable --now pcscd
@@ -20,7 +20,6 @@ import os
 import re
 import shlex
 import shutil
-import concurrent.futures
 from urllib.parse import unquote
 import pexpect
 import subprocess
@@ -134,15 +133,22 @@ def piv_common_name(serial: str) -> str | None:
 
 
 def piv_subjects(keys: list[tuple[str, str]]) -> dict[str, str]:
-    """Look up piv_subject() for every key concurrently.
+    """Look up piv_subject() for every key, one at a time.
 
-    Each call shells out to `ykman piv info`, which is slow enough
-    (especially on FIPS-mode keys) that doing this serially for every
-    connected key noticeably delays the picker showing up at all.
+    This used to run concurrently (ThreadPoolExecutor) to make the
+    picker show up faster - reverted after it turned out to actively
+    corrupt results: two YubiKeys passed through a single shared USB
+    controller (common under virtualization, e.g. two hostdevs on one
+    QEMU UHCI controller) can have their APDU command/response streams
+    cross when queried at the same time. Confirmed with a 60-iteration
+    stress test: concurrent calls failed 26/60 times (mostly
+    "ApduError: APDU error: SW=0x6d00", i.e. "instruction not
+    supported" - the signature of a scrambled command stream - plus a
+    few outright timeouts), while the same test run sequentially failed
+    0/60 times. Not worth the ~1s of startup latency this reintroduces
+    with two keys connected.
     """
-    serials = [serial for serial, _display in keys]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(serials))) as pool:
-        return dict(zip(serials, pool.map(piv_subject, serials)))
+    return {serial: piv_subject(serial) for serial, _display in keys}
 
 
 def pick_via_fzf(keys: list[tuple[str, str]]) -> str | None:
